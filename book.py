@@ -18,7 +18,7 @@ Two things to get right before anything else:
     account-level book shows nothing wrong at all.
 """
 from __future__ import annotations
-
+from decimal import InvalidOperation
 from collections import defaultdict
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -41,11 +41,74 @@ class Book:
         # balances[(customer_id, account)] = debit-positive balance
         self.balances: dict[tuple[str, str], Decimal] = defaultdict(lambda: ZERO)
         self.seen: set[str] = set()
-        # What you have not written yet. An unimplemented handler must not stop
-        # the run: the client keeps consuming and tells you the list at the end.
+
+        # -------- Runtime State --------
+
+        # withdrawal_id -> {"customer_id":..., "amount":...}
+        self.withdrawals = {}
+
+        # fee_event_id -> amount
+        self.fee_events = {}
+
+        # trade_id -> trade details
+        self.trades = {}
+
+        # order_id -> order details
+        self.orders = {}
+
+        # Cash hold per customer
+        self.cash_holds = defaultdict(lambda: ZERO)
+
+        # Shares on hold (customer -> symbol -> quantity)
+        self.share_holds = defaultdict(lambda: defaultdict(lambda: D("0")))
+
+        # Open order routing
+        self.open_order_routes = {}
+
+        # customer -> symbol -> FIFO lots
+        self.positions = defaultdict(lambda: defaultdict(list))
+
+        # event_id -> original journal legs
+        self.original_postings = {}
+
+        # todo list shown after run
         self.todo: dict[str, int] = defaultdict(int)
 
     # -----------------------------------------------------------------------
+    BROKERS = {
+    "BRK-A": {
+        "asset_classes": {"equity", "etf"},
+        "brokerage": D("0.0020"),
+        "custody": D("0.0004"),
+    },
+    "BRK-B": {
+        "asset_classes": {"equity", "bond"},
+        "brokerage": D("0.0015"),
+        "custody": D("0.0005"),
+    },
+    "BRK-C": {
+        "asset_classes": {"etf", "bond"},
+        "brokerage": D("0.0025"),
+        "custody": D("0.0003"),
+    },
+}
+
+    def choose_broker(self, asset_class, principal):
+        best = None
+
+        for broker, cfg in sorted(self.BROKERS.items()):
+            if asset_class not in cfg["asset_classes"]:
+                continue
+
+            charge = money(
+                principal * cfg["brokerage"] +
+                principal * cfg["custody"]
+            )
+
+            if best is None or charge < best[0]:
+                best = (charge, broker)
+
+        return best[1]
     def apply(self, ev: dict) -> list[dict]:
         """Post one event and return its legs.
 
@@ -74,16 +137,28 @@ class Book:
             # must leave your book exactly as it was.
             return []
         self._post(legs)
+
+        if legs:
+            self.original_postings[eid] = [dict(l) for l in legs]
+
         return legs
 
-    def _post(self, legs: list[dict]) -> None:
-        dr = sum(D(l["debit"]) for l in legs)
-        cr = sum(D(l["credit"]) for l in legs)
+    def _post(self, legs):
+
+        if not legs:
+            return
+
+        dr = sum((D(l["debit"]) for l in legs), ZERO)
+        cr = sum((D(l["credit"]) for l in legs), ZERO)
+
         if money(dr) != money(cr):
             raise AssertionError(f"unbalanced: dr {dr} cr {cr}")
+
         for l in legs:
             self.balances[(l["customer_id"], l["account"])] += (
-                D(l["debit"]) - D(l["credit"]))
+                D(l["debit"]) - D(l["credit"])
+            )
+            
 
     # -- worked example -----------------------------------------------------
     def on_deposit(self, p: dict, ev: dict) -> list[dict]:
@@ -98,59 +173,210 @@ class Book:
 
     # -- yours --------------------------------------------------------------
     def on_fee_charged(self, p, ev):
-        raise NotImplementedError("Dr 2010 amount / Cr 1100 amount")
+         cid = p["customer_id"]
+
+         try:
+            amount = money(D(p["amount"]))
+         except (InvalidOperation, KeyError, TypeError):
+            raise Rejected()
+
+         self.fee_events[ev["event_id"]] = {
+            "customer_id": cid,
+            "amount": amount,
+            "refunded": False,
+        }
+
+         return [
+            leg("2010", cid, debit=amount),
+            leg("1100", cid, credit=amount),
+        ]
 
     def on_fee_refund(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1100 / Cr 2010. The amount is NOT in this payload: look it up "
-            "from the fee_charged event named by refunds_source_id")
+        src = p.get("refunds_source_id")
+
+        fee = self.fee_events.get(src)
+
+        if fee is None:
+            raise Rejected()
+
+        if fee["refunded"]:
+            raise Rejected()
+
+        fee["refunded"] = True
+
+        return [
+            leg("1100", fee["customer_id"], debit=fee["amount"]),
+            leg("2010", fee["customer_id"], credit=fee["amount"])
+        ]
 
     def on_interest_credited(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1100 gross / Cr 2010 customer_share / Cr 4200 the remainder")
+        try:
+            cid = p["customer_id"]
+            gross = money(D(p["gross_amount"]))
+            share = money(D(p["customer_share"]))
+        except (KeyError, InvalidOperation, TypeError):
+            raise Rejected()
+
+        income = money(gross - share)
+
+        return [
+            leg("1100", cid, debit=gross),
+            leg("2010", cid, credit=share),
+            leg("4200", cid, credit=income)
+        ]
 
     def on_transfer_between_customers(self, p, ev):
-        raise NotImplementedError(
-            "Dr 2010 (from_customer_id) / Cr 2010 (to_customer_id). Both legs "
-            "land on 2010, so the ACCOUNT nets to zero")
+        try:
+            amount = money(D(p["amount"]))
+        except (KeyError, InvalidOperation, TypeError):
+            raise Rejected()
+
+        return [
+            leg("2010", p["from_customer_id"], debit=amount),
+            leg("2010", p["to_customer_id"], credit=amount)
+        ]
 
     def on_fx_deposit(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1100 usd_at_market_rate / Cr 2010 usd_at_customer_rate / "
-            "Cr 4100 the difference")
+        try:
+            cid = p["customer_id"]
+
+            market = money(D(p["usd_at_market_rate"]))
+            customer = money(D(p["usd_at_customer_rate"]))
+        except (KeyError, InvalidOperation, TypeError):
+            raise Rejected()
+
+        if customer > market:
+            raise Rejected()
+
+        spread = money(market - customer)
+
+        return [
+            leg("1100", cid, debit=market),
+            leg("2010", cid, credit=customer),
+            leg("4100", cid, credit=spread)
+        ]
 
     def on_withdrawal_requested(self, p, ev):
-        raise NotImplementedError("Dr 2010 amount / Cr 2300 amount")
+            try:
+                amount = money(D(p["amount"]))
+                cid = p["customer_id"]
+                wid = p["withdrawal_id"]
+            except (KeyError, InvalidOperation, TypeError):
+                raise Rejected()
+
+            self.withdrawals[wid] = {
+            "customer_id": cid,
+            "amount": amount,
+            "status": "pending"
+        }
+
+            return [
+            leg("2010", cid, debit=amount),
+            leg("2300", cid, credit=amount)
+        ]
+            
 
     def on_withdrawal_settled(self, p, ev):
-        raise NotImplementedError(
-            "Dr 2300 / Cr 1100. Look up the amount from the request")
+        wid = p.get("withdrawal_id")
+
+        if wid not in self.withdrawals:
+            raise Rejected()
+
+        wd = self.withdrawals[wid]
+
+        if wd["status"] != "pending":
+            raise Rejected()
+
+        wd["status"] = "settled"
+
+        return [
+            leg("2300", wd["customer_id"], debit=wd["amount"]),
+            leg("1100", wd["customer_id"], credit=wd["amount"])
+        ]
 
     def on_withdrawal_rejected(self, p, ev):
-        raise NotImplementedError("Dr 2300 / Cr 2010")
+        wid = p.get("withdrawal_id")
 
+        if wid not in self.withdrawals:
+            raise Rejected()
+
+        wd = self.withdrawals[wid]
+
+        if wd["status"] != "pending":
+            raise Rejected()
+
+        wd["status"] = "rejected"
+
+        return [
+            leg("2300", wd["customer_id"], debit=wd["amount"]),
+            leg("2010", wd["customer_id"], credit=wd["amount"])
+        ]
     def on_order_placed(self, p, ev):
-        raise NotImplementedError(
-            "No legs. A placement moves no money: it creates a hold, which is "
-            "reported at checkpoints and never posted")
+        try:
+            oid = p["order_id"]
+            cid = p["customer_id"]
+            side = p["side"]
+
+            qty = D(p["quantity"])
+            limit_price = D(p["limit_price"])
+            est = money(D(p["est_charges"]))
+
+        except Exception:
+            raise Rejected()
+
+        principal = money(qty * limit_price)
+
+        broker = self.choose_broker(
+            p["asset_class"],
+            principal
+        )
+
+        self.orders[oid] = dict(p)
+
+        self.open_order_routes[oid] = broker
+
+        if side == "buy":
+            self.cash_holds[cid] += principal + est
+        else:
+            self.share_holds[cid][p["symbol"]] += qty
+
+        return []
 
     def on_order_partially_filled(self, p, ev):
         return self.on_order_filled(p, ev)
 
     def on_order_filled(self, p, ev):
-        raise NotImplementedError(
-            "buy:  Dr 2010 principal+commission, Dr 1200 principal / "
-            "Cr 2350 principal, Cr 2100 principal, Cr 4000 commission. "
-            "sell: Dr 1150 principal, Dr 2100 FIFO cost / Cr 2010 "
-            "principal-commission-reg, Cr 1200 cost, Cr 4000 commission, "
-            "Cr 2400 reg. Cash does NOT move on the trade date")
+        def on_order_filled(self, p, ev):
+            print("\n===== ORDER FILLED PAYLOAD =====")
+            print(p)
+            raise NotImplementedError()
 
     def on_trade_settled(self, p, ev):
         raise NotImplementedError(
             "buy: Dr 2350 / Cr 1100.  sell: Dr 1100 / Cr 1150")
 
     def on_order_cancelled(self, p, ev):
-        raise NotImplementedError("No legs. Release the remaining hold")
+        oid = p["order_id"]
+
+        order = self.orders.pop(oid, None)
+
+        if order is None:
+            raise Rejected()
+
+        cid = order["customer_id"]
+
+        qty = D(order["quantity"])
+
+        if order["side"] == "buy":
+            principal = money(qty * D(order["limit_price"]))
+            est = money(D(order["est_charges"]))
+            self.cash_holds[cid] -= principal + est
+        else:
+            self.share_holds[cid][order["symbol"]] -= qty
+
+        self.open_order_routes.pop(oid, None)
+
+        return []
 
     def on_order_rejected(self, p, ev):
         return self.on_order_cancelled(p, ev)
@@ -212,3 +438,5 @@ class Rejected(Exception):
     will not parse. Rejecting one event and carrying on beats stopping: a
     server that stalls misses everything after it.
     """
+
+ 
